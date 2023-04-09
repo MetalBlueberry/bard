@@ -1,17 +1,3 @@
-// Copyright 2016 Hajime Hoshi
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
@@ -60,17 +46,7 @@ func (g *Game) Update() error {
 
 func (g *Game) Draw(screen *ebiten.Image) {
 
-	// g.buff = g.echo.AsyncFFT.CoppyBuffer(g.buff)
-	// r := g.echo.AsyncFFT.Result()
-
 	g.buff = g.echo.CoppyBuffer(g.buff)
-	// r, err := g.echo.Tunner.Analyze()
-	// if err != nil {
-	// 	log.Println(err)
-	// 	return
-	// }
-
-	// ebitenutil.DebugPrint(screen, fmt.Sprintf("%#v", r.NoteValues))
 
 	up := screen.SubImage(image.Rect(0, 0, screen.Bounds().Dx(), screen.Bounds().Dy()/2)).(*ebiten.Image)
 	down := screen.SubImage(image.Rect(0, screen.Bounds().Dy()/2, screen.Bounds().Dx(), screen.Bounds().Dy())).(*ebiten.Image)
@@ -80,19 +56,8 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	notes := make([]float64, 0, len(generateNotes()))
 	X := fft.FFTReal(g.buff)
 
-	// log.Println(g.echo.inputDevice.DefaultSampleRate)
 	resolution := g.echo.inputDevice.DefaultSampleRate / float64(len(g.buff))
 
-	// // Print the magnitude and phase at each frequency.
-	// for i := 0; i < len(g.buff); i++ {
-	// 	freq := resolution * float64(i)
-	// 	if freq < 50 && freq > 2000 {
-	// 		continue
-	// 	}
-
-	// 	notes = append(notes, r)
-
-	// }
 	tt, err := opentype.Parse(fonts.MPlus1pRegular_ttf)
 	if err != nil {
 		log.Fatal(err)
@@ -225,13 +190,7 @@ func main() {
 	e := newAudioTee()
 	defer e.Close()
 	chk(e.Start())
-	// e.AsyncFFT.Run(ctx)
 	defer e.Stop()
-
-	// select {
-	// case <-time.After(30 * time.Second):
-	// case <-ctx.Done():
-	// }
 
 	log.Println("ready")
 	ebiten.SetWindowSize(screenWidth, screenHeight)
@@ -249,14 +208,10 @@ func main() {
 
 type audioTee struct {
 	*portaudio.Stream
-	i           int
 	inputDevice *portaudio.DeviceInfo
 
-	// buff           []float64
 	circularBuffer circular.Buffer
 	lock           sync.Mutex
-	// Tunner         *tuner.Tuner
-	// AsyncFFT    *AsyncFFT
 }
 
 func newAudioTee() *audioTee {
@@ -269,28 +224,28 @@ func newAudioTee() *audioTee {
 	for _, device := range h.Devices {
 		if strings.Contains(device.Name, "Live camera") {
 			input = device
-			// output = device
-			break
-		}
-	}
-	for _, device := range h.Devices {
-		if strings.Contains(device.Name, "Jabra") {
-			// input = device
-			output = device
 			break
 		}
 	}
 	if input == nil {
 		panic("couldn't find input")
 	}
+	for _, device := range h.Devices {
+		if strings.Contains(device.Name, "Jabra") {
+			output = device
+			break
+		}
+	}
+	if output == nil {
+		panic("couldn't find input")
+	}
+
 	p := portaudio.HighLatencyParameters(input, output)
 	p.Input.Channels = 1
 	p.Output.Channels = 1
 	e := &audioTee{
-		inputDevice: input,
-		// AsyncFFT:    NewAsyncFFT(),
+		inputDevice:    input,
 		circularBuffer: circular.CreateBuffer(44100 / 25),
-		// Tunner:         tuner.Create(),
 	}
 	e.Stream, err = portaudio.OpenStream(p, e.processAudio)
 	chk(err)
@@ -302,109 +257,20 @@ func (e *audioTee) processAudio(in, out []float32) {
 
 	e.lock.Lock()
 	defer e.lock.Unlock()
-	// e.buff = e.buff[:0]
 	for i := range in {
-		// 	e.buff = append(e.buff, float64(in[i]))
 		e.circularBuffer.Enqueue(float64(in[i]))
 	}
-	// e.Tunner.Process(e.buff, uint32(e.inputDevice.DefaultSampleRate))
 }
 
 func (e *audioTee) CoppyBuffer(out []float64) []float64 {
 	e.lock.Lock()
 	defer e.lock.Unlock()
-	// out = out[0:0]
-	// out = append(out, e.buff...)
-	// circu
 	if len(out) != e.circularBuffer.Length() {
 		out = make([]float64, e.circularBuffer.Length())
 	}
 	e.circularBuffer.Retrieve(out)
 	return out
 }
-
-// type AsyncFFT struct {
-// 	*tuner.Tuner
-// 	result *tuner.Result
-
-// 	buff       []float64
-// 	rate       float64
-// 	ready      chan struct{}
-// 	lock       sync.Mutex
-// 	resultLock sync.Mutex
-// }
-
-// func NewAsyncFFT() *AsyncFFT {
-// 	return &AsyncFFT{
-// 		Tuner:      tuner.Create(),
-// 		buff:       make([]float64, 0),
-// 		ready:      make(chan struct{}),
-// 		lock:       sync.Mutex{},
-// 		resultLock: sync.Mutex{},
-// 		result:     nil,
-// 	}
-
-// }
-
-// func (async *AsyncFFT) Process(samples []float32, rate float64) {
-// 	async.lock.Lock()
-// 	defer async.lock.Unlock()
-
-// 	select {
-// 	case async.ready <- struct{}{}:
-// 		async.buff = async.buff[0:0]
-// 		async.rate = rate
-// 		for i := range samples {
-// 			async.buff = append(async.buff, float64(samples[i]))
-// 		}
-// 	default:
-// 	}
-
-// }
-
-// func (async *AsyncFFT) CoppyBuffer(out []float64) []float64 {
-// 	async.lock.Lock()
-// 	defer async.lock.Unlock()
-// 	out = out[0:0]
-// 	out = append(out, async.buff...)
-// 	return out
-// }
-
-// func (async *AsyncFFT) Result() tuner.Result {
-// 	async.resultLock.Lock()
-// 	defer async.resultLock.Unlock()
-// 	return *async.result
-// }
-
-// func (async *AsyncFFT) Run(ctx context.Context) {
-
-// 	go func() {
-// 		for {
-// 			select {
-// 			case <-async.ready:
-
-// 				async.lock.Lock()
-// 				async.lock.Unlock()
-
-// 				// log.Println("process: ", async.buff)
-// 				async.Tuner.Process(async.buff, uint32(async.rate))
-// 				result, err := async.Tuner.Analyze()
-// 				if err != nil {
-// 					panic(err)
-// 				}
-// 				if async.result == nil || async.result.Note() != result.Note() {
-
-// 					async.resultLock.Lock()
-// 					async.result = result
-// 					async.resultLock.Unlock()
-// 				}
-// 			case <-ctx.Done():
-// 				return
-// 			}
-
-// 		}
-// 	}()
-// }
 
 func chk(err error) {
 	if err != nil {
