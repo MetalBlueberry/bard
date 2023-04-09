@@ -20,17 +20,24 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"math"
+	"math/cmplx"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/andrepxx/go-dsp-guitar/circular"
 	"github.com/gordonklaus/portaudio"
 	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/examples/resources/fonts"
+	"github.com/hajimehoshi/ebiten/v2/text"
 	"github.com/hajimehoshi/ebiten/v2/vector"
-	"github.com/metalblueberry/bard/pkg/tuner"
+	"github.com/mjibson/go-dsp/dsputils"
+	"github.com/mjibson/go-dsp/fft"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/opentype"
 )
 
 const (
@@ -53,25 +60,101 @@ func (g *Game) Update() error {
 
 func (g *Game) Draw(screen *ebiten.Image) {
 
-	g.buff = g.echo.AsyncFFT.CoppyBuffer(g.buff)
-	r := g.echo.AsyncFFT.Result()
-	ebitenutil.DebugPrint(screen, fmt.Sprintf("%#v", r.NoteValues))
+	// g.buff = g.echo.AsyncFFT.CoppyBuffer(g.buff)
+	// r := g.echo.AsyncFFT.Result()
+
+	g.buff = g.echo.CoppyBuffer(g.buff)
+	// r, err := g.echo.Tunner.Analyze()
+	// if err != nil {
+	// 	log.Println(err)
+	// 	return
+	// }
+
+	// ebitenutil.DebugPrint(screen, fmt.Sprintf("%#v", r.NoteValues))
 
 	up := screen.SubImage(image.Rect(0, 0, screen.Bounds().Dx(), screen.Bounds().Dy()/2)).(*ebiten.Image)
 	down := screen.SubImage(image.Rect(0, screen.Bounds().Dy()/2, screen.Bounds().Dx(), screen.Bounds().Dy())).(*ebiten.Image)
 	g.drawWave(up, g.buff, 1)
-	notes := make([]float64, len(r.NoteValues))
-	for i, n := range r.NoteValues {
-		// log.Println(n.Value)
-		// log.Println(n.Value)
-		if n.Value > 100 {
-			notes[i] = 100
-		} else {
-			notes[i] = n.Value
+
+	tuneNotes := generateNotes()
+	notes := make([]float64, 0, len(generateNotes()))
+	X := fft.FFTReal(g.buff)
+
+	// log.Println(g.echo.inputDevice.DefaultSampleRate)
+	resolution := g.echo.inputDevice.DefaultSampleRate / float64(len(g.buff))
+
+	// // Print the magnitude and phase at each frequency.
+	// for i := 0; i < len(g.buff); i++ {
+	// 	freq := resolution * float64(i)
+	// 	if freq < 50 && freq > 2000 {
+	// 		continue
+	// 	}
+
+	// 	notes = append(notes, r)
+
+	// }
+	tt, err := opentype.Parse(fonts.MPlus1pRegular_ttf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	mplusNormalFont, err := opentype.NewFace(tt, &opentype.FaceOptions{
+		Size:    12,
+		DPI:     72,
+		Hinting: font.HintingVertical,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	var max *NoteStruct
+	var maxValue float64
+	for i := range tuneNotes {
+		indexValue := tuneNotes[i].Frequency / resolution
+		lowIndex := int(math.Floor(indexValue))
+		highIndex := int(math.Ceil(indexValue))
+		r := (magnitude(lowIndex, X) + magnitude(highIndex, X)) / 2
+		if maxValue < r {
+			max = &tuneNotes[i]
+			maxValue = r
 		}
 	}
-	g.drawWave(down, notes, 1000)
 
+	for i, tuneNote := range tuneNotes {
+		indexValue := tuneNote.Frequency / resolution
+		lowIndex := int(math.Floor(indexValue))
+		highIndex := int(math.Ceil(indexValue))
+
+		r := (magnitude(lowIndex, X) + magnitude(highIndex, X)) / 2
+		notes = append(notes, r)
+
+		playing := 12
+		if r > 3 {
+			playing = 20 + 12
+			fmt.Printf("%s, %.1fHz = %.1f\n", tuneNote.Name, tuneNote.Frequency, r)
+		}
+		c := color.Color(color.White)
+		if max.Name == tuneNote.Name {
+			c = color.NRGBA{
+				R: 255,
+				G: 0,
+				B: 0,
+				A: 255,
+			}
+		}
+
+		text.Draw(screen, tuneNote.Name, mplusNormalFont, i*screen.Bounds().Dx()/len(tuneNotes), playing, c)
+	}
+	g.drawWave(down, notes, 100)
+
+}
+
+func magnitude(index int, X []complex128) float64 {
+	r, θ := cmplx.Polar(X[index])
+	θ *= 360.0 / (2 * math.Pi)
+	if dsputils.Float64Equal(r, 0) {
+		θ = 0 // (When the magnitude is close to 0, the angle is meaningless)
+	}
+	return r
 }
 
 var (
@@ -95,16 +178,13 @@ func (g *Game) drawWave(screen *ebiten.Image, data []float64, size float64) {
 
 	scale := float64(mid) / size
 	for i := range data {
-		y := float32((data[i] * float64(scale)) + float64(mid))
+		y := float32((-data[i] * float64(scale)) + float64(mid))
 		// log.Println(y)
 		path.LineTo(float32(i*width)/float32(len(data)), y)
 	}
 
 	// Draw the main line in white.
 	op := &vector.StrokeOptions{}
-	// op.LineCap = cap
-	// op.LineJoin = join
-	// op.MiterLimit = miterLimit
 	op.Width = float32(1)
 	vs, is := path.AppendVerticesAndIndicesForStroke(g.vertices[:0], g.indices[:0], op)
 	for i := range vs {
@@ -145,7 +225,7 @@ func main() {
 	e := newAudioTee()
 	defer e.Close()
 	chk(e.Start())
-	e.AsyncFFT.Run(ctx)
+	// e.AsyncFFT.Run(ctx)
 	defer e.Stop()
 
 	// select {
@@ -171,7 +251,12 @@ type audioTee struct {
 	*portaudio.Stream
 	i           int
 	inputDevice *portaudio.DeviceInfo
-	AsyncFFT    *AsyncFFT
+
+	// buff           []float64
+	circularBuffer circular.Buffer
+	lock           sync.Mutex
+	// Tunner         *tuner.Tuner
+	// AsyncFFT    *AsyncFFT
 }
 
 func newAudioTee() *audioTee {
@@ -179,22 +264,33 @@ func newAudioTee() *audioTee {
 	chk(err)
 	var input, output *portaudio.DeviceInfo
 	for _, device := range h.Devices {
-		if strings.Contains(device.Name, "Jabra") {
+		log.Println(device)
+	}
+	for _, device := range h.Devices {
+		if strings.Contains(device.Name, "Live camera") {
 			input = device
+			// output = device
+			break
+		}
+	}
+	for _, device := range h.Devices {
+		if strings.Contains(device.Name, "Jabra") {
+			// input = device
 			output = device
 			break
 		}
 	}
 	if input == nil {
-		panic("couldn't find Jabra input")
+		panic("couldn't find input")
 	}
 	p := portaudio.HighLatencyParameters(input, output)
-	// p := portaudio.LowLatencyParameters(input, output)
 	p.Input.Channels = 1
 	p.Output.Channels = 1
 	e := &audioTee{
 		inputDevice: input,
-		AsyncFFT:    NewAsyncFFT(),
+		// AsyncFFT:    NewAsyncFFT(),
+		circularBuffer: circular.CreateBuffer(44100 / 25),
+		// Tunner:         tuner.Create(),
 	}
 	e.Stream, err = portaudio.OpenStream(p, e.processAudio)
 	chk(err)
@@ -203,94 +299,377 @@ func newAudioTee() *audioTee {
 
 func (e *audioTee) processAudio(in, out []float32) {
 	copy(out, in)
-	e.AsyncFFT.Process(in, e.inputDevice.DefaultSampleRate)
-}
 
-type AsyncFFT struct {
-	*tuner.Tuner
-	result *tuner.Result
-
-	buff       []float64
-	rate       float64
-	ready      chan struct{}
-	lock       sync.Mutex
-	resultLock sync.Mutex
-}
-
-func NewAsyncFFT() *AsyncFFT {
-	return &AsyncFFT{
-		Tuner:      tuner.Create(),
-		buff:       make([]float64, 0),
-		ready:      make(chan struct{}),
-		lock:       sync.Mutex{},
-		resultLock: sync.Mutex{},
-		result:     nil,
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	// e.buff = e.buff[:0]
+	for i := range in {
+		// 	e.buff = append(e.buff, float64(in[i]))
+		e.circularBuffer.Enqueue(float64(in[i]))
 	}
-
+	// e.Tunner.Process(e.buff, uint32(e.inputDevice.DefaultSampleRate))
 }
 
-func (async *AsyncFFT) Process(samples []float32, rate float64) {
-	async.lock.Lock()
-	defer async.lock.Unlock()
-
-	select {
-	case async.ready <- struct{}{}:
-		async.buff = async.buff[0:0]
-		async.rate = rate
-		for i := range samples {
-			async.buff = append(async.buff, float64(samples[i]))
-		}
-	default:
+func (e *audioTee) CoppyBuffer(out []float64) []float64 {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	// out = out[0:0]
+	// out = append(out, e.buff...)
+	// circu
+	if len(out) != e.circularBuffer.Length() {
+		out = make([]float64, e.circularBuffer.Length())
 	}
-
-}
-
-func (async *AsyncFFT) CoppyBuffer(out []float64) []float64 {
-	async.lock.Lock()
-	defer async.lock.Unlock()
-	out = out[0:0]
-	out = append(out, async.buff...)
+	e.circularBuffer.Retrieve(out)
 	return out
 }
 
-func (async *AsyncFFT) Result() tuner.Result {
-	async.resultLock.Lock()
-	defer async.resultLock.Unlock()
-	return *async.result
-}
+// type AsyncFFT struct {
+// 	*tuner.Tuner
+// 	result *tuner.Result
 
-func (async *AsyncFFT) Run(ctx context.Context) {
+// 	buff       []float64
+// 	rate       float64
+// 	ready      chan struct{}
+// 	lock       sync.Mutex
+// 	resultLock sync.Mutex
+// }
 
-	go func() {
-		for {
-			select {
-			case <-async.ready:
+// func NewAsyncFFT() *AsyncFFT {
+// 	return &AsyncFFT{
+// 		Tuner:      tuner.Create(),
+// 		buff:       make([]float64, 0),
+// 		ready:      make(chan struct{}),
+// 		lock:       sync.Mutex{},
+// 		resultLock: sync.Mutex{},
+// 		result:     nil,
+// 	}
 
-				async.lock.Lock()
-				async.lock.Unlock()
+// }
 
-				// log.Println("process: ", async.buff)
-				async.Tuner.Process(async.buff, uint32(async.rate))
-				result, err := async.Tuner.Analyze()
-				if err != nil {
-					panic(err)
-				}
-				if async.result == nil || async.result.Note() != result.Note() {
+// func (async *AsyncFFT) Process(samples []float32, rate float64) {
+// 	async.lock.Lock()
+// 	defer async.lock.Unlock()
 
-					async.resultLock.Lock()
-					async.result = result
-					async.resultLock.Unlock()
-				}
-			case <-ctx.Done():
-				return
-			}
+// 	select {
+// 	case async.ready <- struct{}{}:
+// 		async.buff = async.buff[0:0]
+// 		async.rate = rate
+// 		for i := range samples {
+// 			async.buff = append(async.buff, float64(samples[i]))
+// 		}
+// 	default:
+// 	}
 
-		}
-	}()
-}
+// }
+
+// func (async *AsyncFFT) CoppyBuffer(out []float64) []float64 {
+// 	async.lock.Lock()
+// 	defer async.lock.Unlock()
+// 	out = out[0:0]
+// 	out = append(out, async.buff...)
+// 	return out
+// }
+
+// func (async *AsyncFFT) Result() tuner.Result {
+// 	async.resultLock.Lock()
+// 	defer async.resultLock.Unlock()
+// 	return *async.result
+// }
+
+// func (async *AsyncFFT) Run(ctx context.Context) {
+
+// 	go func() {
+// 		for {
+// 			select {
+// 			case <-async.ready:
+
+// 				async.lock.Lock()
+// 				async.lock.Unlock()
+
+// 				// log.Println("process: ", async.buff)
+// 				async.Tuner.Process(async.buff, uint32(async.rate))
+// 				result, err := async.Tuner.Analyze()
+// 				if err != nil {
+// 					panic(err)
+// 				}
+// 				if async.result == nil || async.result.Note() != result.Note() {
+
+// 					async.resultLock.Lock()
+// 					async.result = result
+// 					async.resultLock.Unlock()
+// 				}
+// 			case <-ctx.Done():
+// 				return
+// 			}
+
+// 		}
+// 	}()
+// }
 
 func chk(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+type Notes []NoteStruct
+
+func generateNotes() Notes {
+
+	/*
+	 * Create a list of appropriate notes.
+	 */
+	notes := []NoteStruct{
+		// {
+		// 	Name:      "H1",
+		// 	Frequency: 61.7354,
+		// },
+		// {
+		// 	Name:      "C2",
+		// 	Frequency: 65.4064,
+		// },
+		// {
+		// 	Name:      "C#2",
+		// 	Frequency: 69.2957,
+		// },
+		// {
+		// 	Name:      "D2",
+		// 	Frequency: 73.4162,
+		// },
+		// {
+		// 	Name:      "D#2",
+		// 	Frequency: 77.7817,
+		// },
+		// {
+		// 	Name:      "E2",
+		// 	Frequency: 82.4069,
+		// },
+		// {
+		// 	Name:      "F2",
+		// 	Frequency: 87.3071,
+		// },
+		// {
+		// 	Name:      "F#2",
+		// 	Frequency: 92.4986,
+		// },
+		// {
+		// 	Name:      "G2",
+		// 	Frequency: 97.9989,
+		// },
+		// {
+		// 	Name:      "G#2",
+		// 	Frequency: 103.8262,
+		// },
+		// {
+		// 	Name:      "A2",
+		// 	Frequency: 110.0000,
+		// },
+		// {
+		// 	Name:      "A#2",
+		// 	Frequency: 116.5409,
+		// },
+		// {
+		// 	Name:      "H2",
+		// 	Frequency: 123.4708,
+		// },
+		// {
+		// 	Name:      "C3",
+		// 	Frequency: 130.8128,
+		// },
+		// {
+		// 	Name:      "C#3",
+		// 	Frequency: 138.5913,
+		// },
+		// {
+		// 	Name:      "D3",
+		// 	Frequency: 146.8324,
+		// },
+		// {
+		// 	Name:      "D#3",
+		// 	Frequency: 155.5635,
+		// },
+		// {
+		// 	Name:      "E3",
+		// 	Frequency: 164.8138,
+		// },
+		// {
+		// 	Name:      "F3",
+		// 	Frequency: 174.6141,
+		// },
+		// {
+		// 	Name:      "F#3",
+		// 	Frequency: 184.9972,
+		// },
+		// {
+		// 	Name:      "G3",
+		// 	Frequency: 195.9978,
+		// },
+		// {
+		// 	Name:      "G#3",
+		// 	Frequency: 207.6523,
+		// },
+		// {
+		// 	Name:      "A3",
+		// 	Frequency: 220.0000,
+		// },
+		// {
+		// 	Name:      "A#3",
+		// 	Frequency: 233.0819,
+		// },
+		// {
+		// 	Name:      "H3",
+		// 	Frequency: 246.9417,
+		// },
+		{
+			Name:      "C4",
+			Frequency: 261.6256,
+		},
+		{
+			Name:      "C#4",
+			Frequency: 277.1826,
+		},
+		{
+			Name:      "D4",
+			Frequency: 293.6648,
+		},
+		{
+			Name:      "D#4",
+			Frequency: 311.1270,
+		},
+		{
+			Name:      "E4",
+			Frequency: 329.6276,
+		},
+		{
+			Name:      "F4",
+			Frequency: 349.2282,
+		},
+		{
+			Name:      "F#4",
+			Frequency: 369.9944,
+		},
+		{
+			Name:      "G4",
+			Frequency: 391.9954,
+		},
+		{
+			Name:      "G#4",
+			Frequency: 415.3047,
+		},
+		{
+			Name:      "A4",
+			Frequency: 440.0000,
+		},
+		{
+			Name:      "A#4",
+			Frequency: 466.1638,
+		},
+		{
+			Name:      "H4",
+			Frequency: 493.8833,
+		},
+		{
+			Name:      "C5",
+			Frequency: 523.2511,
+		},
+		{
+			Name:      "C#5",
+			Frequency: 554.3653,
+		},
+		{
+			Name:      "D5",
+			Frequency: 587.3295,
+		},
+		{
+			Name:      "D#5",
+			Frequency: 622.2540,
+		},
+		{
+			Name:      "E5",
+			Frequency: 659.2551,
+		},
+		{
+			Name:      "F5",
+			Frequency: 698.4565,
+		},
+		{
+			Name:      "F#5",
+			Frequency: 739.9888,
+		},
+		{
+			Name:      "G5",
+			Frequency: 783.9909,
+		},
+		{
+			Name:      "G#5",
+			Frequency: 830.6094,
+		},
+		{
+			Name:      "A5",
+			Frequency: 880.0000,
+		},
+		{
+			Name:      "A#5",
+			Frequency: 932.3275,
+		},
+		{
+			Name:      "H5",
+			Frequency: 987.7666,
+		},
+		{
+			Name:      "C6",
+			Frequency: 1046.5023,
+		},
+		{
+			Name:      "C#6",
+			Frequency: 1108.7305,
+		},
+		{
+			Name:      "D6",
+			Frequency: 1174.6591,
+		},
+		{
+			Name:      "D#6",
+			Frequency: 1244.5079,
+		},
+		{
+			Name:      "E6",
+			Frequency: 1318.5102,
+		},
+		// {
+		// 	Name:      "F6",
+		// 	Frequency: 1396.9129,
+		// },
+		// {
+		// 	Name:      "F#6",
+		// 	Frequency: 1479.9777,
+		// },
+		// {
+		// 	Name:      "G6",
+		// 	Frequency: 1567.9817,
+		// },
+		// {
+		// 	Name:      "G#6",
+		// 	Frequency: 1661.2188,
+		// },
+		// {
+		// 	Name:      "A6",
+		// 	Frequency: 1760.0000,
+		// },
+		// {
+		// 	Name:      "A#6",
+		// 	Frequency: 1864.6550,
+		// },
+		// {
+		// 	Name:      "H6",
+		// 	Frequency: 1975.5332,
+		// },
+	}
+
+	return notes
+}
+
+type NoteStruct struct {
+	Name      string
+	Frequency float64
 }
