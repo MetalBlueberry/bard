@@ -14,12 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andrepxx/go-dsp-guitar/circular"
 	"github.com/gordonklaus/portaudio"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/examples/resources/fonts"
 	"github.com/hajimehoshi/ebiten/v2/text"
 	"github.com/hajimehoshi/ebiten/v2/vector"
+	"github.com/metalblueberry/bard/pkg/circular"
 	"github.com/mjibson/go-dsp/dsputils"
 	"github.com/mjibson/go-dsp/fft"
 	"golang.org/x/image/font"
@@ -27,41 +27,42 @@ import (
 )
 
 const (
-	screenWidth  = 640
-	screenHeight = 480
+	screenWidth  = 640 * 2
+	screenHeight = 480 * 2
 )
 
 type Game struct {
-	ctx  context.Context
-	echo *audioTee
-	buff []float64
+	ctx     context.Context
+	echo    *audioTee
+	buff    []float64
+	fftBuff []float64
 
 	vertices []ebiten.Vertex
 	indices  []uint16
+
+	Track Track
+}
+
+type Track struct {
+	Tracks *circular.Buffer[Notes]
+}
+
+func (t *Track) Last() []NoteStruct {
+	last := t.Tracks.At(t.Tracks.Length() - 1)
+	if last == nil {
+		return nil
+	}
+	return *last
 }
 
 func (g *Game) Update() error {
-	return g.ctx.Err()
-}
-
-func (g *Game) Draw(screen *ebiten.Image) {
-
-	g.buff = g.echo.CoppyBuffer(g.buff)
-
-	up := screen.SubImage(image.Rect(0, 0, screen.Bounds().Dx(), screen.Bounds().Dy()/2)).(*ebiten.Image)
-	down := screen.SubImage(image.Rect(0, screen.Bounds().Dy()/2, screen.Bounds().Dx(), screen.Bounds().Dy())).(*ebiten.Image)
-
-	g.drawWave(up, g.buff, 1, 10)
+	g.fftBuff = g.echo.CoppyBuffer(g.fftBuff)
 
 	tuneNotes := generateNotes()
-	notes := make([]float64, 0, len(generateNotes()))
 
-	X := fft.FFTReal(g.buff)
+	X := fft.FFTReal(g.fftBuff)
 
-	resolution := g.echo.inputDevice.DefaultSampleRate / float64(len(g.buff))
-
-	var max *NoteStruct
-	var maxValue float64
+	resolution := g.echo.inputDevice.DefaultSampleRate / float64(len(g.fftBuff))
 
 	for i := range tuneNotes {
 		indexValue := tuneNotes[i].Frequency / resolution
@@ -69,9 +70,30 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		highIndex := int(math.Ceil(indexValue))
 		r := (magnitude(lowIndex, X) + magnitude(highIndex, X)) / 2
 		tuneNotes[i].Value = r
-		if maxValue < r {
+	}
+	g.Track.Tracks.Enqueue(tuneNotes)
+	g.Track.Last()
+
+	return g.ctx.Err()
+}
+
+func (g *Game) Draw(screen *ebiten.Image) {
+	up := screen.SubImage(image.Rect(0, 0, screen.Bounds().Dx(), screen.Bounds().Dy()/2)).(*ebiten.Image)
+	down := screen.SubImage(image.Rect(0, screen.Bounds().Dy()/2, screen.Bounds().Dx(), screen.Bounds().Dy())).(*ebiten.Image)
+
+	g.buff = g.echo.CoppyBuffer(g.buff)
+	g.drawWave(up, g.buff, 1, 10)
+	notes := make([]float64, 0, len(generateNotes()))
+
+	tuneNotes := g.Track.Last()
+
+	var max *NoteStruct
+	var maxValue float64
+
+	for i := range tuneNotes {
+		if maxValue < tuneNotes[i].Value {
 			max = &tuneNotes[i]
-			maxValue = r
+			maxValue = tuneNotes[i].Value
 		}
 	}
 
@@ -147,7 +169,6 @@ func (g *Game) drawWave(screen *ebiten.Image, data []float64, size float64, step
 	scale := float64(mid) / size
 	for i := 0; i < len(data); i = i + step {
 		y := float32((-data[i] * float64(scale)) + float64(mid))
-		// log.Println(y)
 		path.LineTo(float32(i*width)/float32(len(data)), y)
 	}
 
@@ -170,7 +191,7 @@ func (g *Game) drawWave(screen *ebiten.Image, data []float64, size float64, step
 }
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
-	return outsideWidth, outsideHeight
+	return screenWidth, screenHeight
 }
 
 func main() {
@@ -200,9 +221,13 @@ func main() {
 
 	ebiten.SetWindowTitle("Sine Wave (Ebitengine Demo)")
 	if err := ebiten.RunGame(&Game{
-		ctx:  ctx,
-		echo: e,
-		buff: make([]float64, 0),
+		ctx:     ctx,
+		echo:    e,
+		buff:    make([]float64, 0),
+		fftBuff: make([]float64, 0),
+		Track: Track{
+			Tracks: circular.CreateBuffer[Notes](60),
+		},
 	}); err != nil {
 		log.Println(err)
 	}
@@ -213,7 +238,7 @@ type audioTee struct {
 	*portaudio.Stream
 	inputDevice *portaudio.DeviceInfo
 
-	circularBuffer circular.Buffer
+	circularBuffer *circular.Buffer[float64]
 	lock           sync.Mutex
 }
 
@@ -248,7 +273,7 @@ func newAudioTee() *audioTee {
 	p.Output.Channels = 1
 	e := &audioTee{
 		inputDevice:    input,
-		circularBuffer: circular.CreateBuffer(44100 / 8),
+		circularBuffer: circular.CreateBuffer[float64](44100 / 8),
 	}
 	e.Stream, err = portaudio.OpenStream(p, e.processAudio)
 	chk(err)
